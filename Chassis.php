@@ -1,0 +1,751 @@
+<?php
+
+namespace Fabricate\Chassis;
+
+use Closure;
+use Exception;
+use ArrayAccess;
+use ReflectionClass;
+use ReflectionAttribute;
+use ReflectionException;
+use ReflectionParameter;
+use InvalidArgumentException;
+use Fabricate\Chassis\Concerns\Bindings;
+use Fabricate\Chassis\Attributes\Scoped;
+use Fabricate\Chassis\Concerns\Singletons;
+use Fabricate\Chassis\Attributes\Singleton;
+use Fabricate\Chassis\Concerns\CallbackManagement;
+use Fabricate\Chassis\Concerns\MagicAliasTracking;
+use Fabricate\NutsAndBolts\Concerns\ReflectsClosures;
+use Fabricate\Contracts\Chassis\WireframeServiceContainer;
+use Fabricate\Contracts\Chassis\BindingResolutionException;
+use Fabricate\Contracts\Chassis\CircularDependencyException;
+
+class Chassis implements WireframeServiceContainer, ArrayAccess
+{
+    use ReflectsClosures;
+    use Bindings, MagicAliasTracking, Singletons;
+    use CallbackManagement;
+
+    /**
+     * The current globally available service container (if any).
+     *
+     * @var static
+     */
+    protected static WireframeServiceContainer $container;
+
+    /**
+     * An array of the types that have been resolved.
+     *
+     * @var bool[]
+     */
+    protected array $resolved = [];
+
+    /**
+     * The extension closures for services.
+     *
+     * @var array[]
+     */
+    protected array $extenders = [];
+
+    /**
+     * Every registered tag.
+     *
+     * @var array[]
+     */
+    protected array $tags = [];
+
+    /**
+     * The stack of concretions currently being built.
+     *
+     * @var array[]
+     */
+    protected array $buildStack = [];
+
+    /**
+     * The parameter override stack.
+     *
+     * @var array[]
+     */
+    protected array $with = [];
+
+    /**
+     * The callback used to determine the container's environment.
+     *
+     * @var (callable(array<int, string>|string): bool|string)|null
+     */
+    protected $environmentResolver = null;
+
+    /**
+     * Determine if the given abstract type has been bound.
+     *
+     * @param string $abstract
+     * @return bool
+     */
+    public function bound(string $abstract): bool
+    {
+        return isset($this->bindings[$abstract]) ||
+            isset($this->instances[$abstract]) ||
+            $this->isAlias($abstract);
+    }
+
+    /**
+     * Resolve the given type from the container.
+     *
+     * @template TClass of object
+     *
+     * @param string|class-string<TClass> $abstract
+     * @return ($abstract is class-string<TClass> ? TClass : mixed)
+     *
+     * @throws BindingResolutionException|CircularDependencyException|ReflectionException
+     */
+    public function make(string $abstract, array $parameters = []): mixed
+    {
+        return $this->resolve($abstract, $parameters);
+    }
+
+    /**
+     * Resolve the given type from the container.
+     *
+     * @template TClass of object
+     *
+     * @param callable|string|class-string<TClass> $abstract
+     * @param array $parameters
+     * @param bool $raiseEvents
+     * @return ($abstract is class-string<TClass> ? TClass : mixed)
+     *
+     * @throws BindingResolutionException
+     * @throws CircularDependencyException
+     * @throws ReflectionException
+     */
+    protected function resolve(callable|string $abstract, array $parameters = [], bool $raiseEvents = true): mixed
+    {
+        $abstract = $this->getAlias($abstract);
+
+        // First we'll fire any event handlers which handle the "before" resolving of
+        // specific types. This gives some hooks the chance to add various extends
+        // calls to change the resolution of objects that they're interested in.
+        if ($raiseEvents) {
+            $this->fireBeforeResolvingCallbacks($abstract, $parameters);
+        }
+
+        $concrete = $this->getContextualConcrete($abstract);
+
+        $needsContextualBuild = ! empty($parameters) || ! is_null($concrete);
+
+        // If an instance of the type is currently being managed as a singleton we'll
+        // just return an existing instance instead of instantiating new instances
+        // so the developer can keep using the same objects instance every time.
+        if (isset($this->instances[$abstract]) && ! $needsContextualBuild) {
+            return $this->instances[$abstract];
+        }
+
+        $this->with[] = $parameters;
+
+        if (is_null($concrete)) {
+            $concrete = $this->getConcrete($abstract);
+        }
+
+        // We're ready to instantiate an instance of the concrete type registered for
+        // the binding. This will instantiate the types, as well as resolve any of
+        // its "nested" dependencies recursively until all have gotten resolved.
+        $object = $this->isBuildable($concrete, $abstract)
+            ? $this->build($concrete)
+            : $this->make($concrete);
+
+        // If we defined any extenders for this type, we'll need to spin through them
+        // and apply them to the object being built. This allows for the extension
+        // of services, such as changing configuration or decorating the object.
+        foreach ($this->getExtenders($abstract) as $extender) {
+            $object = $extender($object, $this);
+        }
+
+        // If the requested type is registered as a singleton we'll want to cache off
+        // the instances in "memory" so we can return it later without creating an
+        // entirely new instance of an object on each subsequent request for it.
+        if ($this->isShared($abstract) && ! $needsContextualBuild) {
+            $this->instances[$abstract] = $object;
+        }
+
+        if ($raiseEvents) {
+            $this->fireResolvingCallbacks($abstract, $object);
+        }
+
+        // Before returning, we will also set the resolved flag to "true" and pop off
+        // the parameter overrides for this build. After those two things are done
+        // we will be ready to return back the fully constructed class instance.
+        if (! $needsContextualBuild) {
+            $this->resolved[$abstract] = true;
+        }
+
+        array_pop($this->with);
+
+        return $object;
+    }
+
+    /**
+     * Determine the environment for the container.
+     *
+     * @param string|array<int, string> $environments
+     * @return bool
+     */
+    public function currentEnvironmentIs(array|string $environments): bool
+    {
+        return $this->environmentResolver === null
+            ? false
+            : call_user_func($this->environmentResolver, $environments);
+    }
+
+    /**
+     * Determine if a ReflectionClass has scoping attributes applied.
+     *
+     * @param  ReflectionClass<object>|class-string  $reflection
+     * @return "singleton"|"scoped"|null
+     */
+    protected function getScopedTyped(ReflectionClass|string $reflection): ?string
+    {
+        $className = $reflection instanceof ReflectionClass
+            ? $reflection->getName()
+            : $reflection;
+
+        if (array_key_exists($className, $this->checkedForSingletonOrScopedAttributes)) {
+            return $this->checkedForSingletonOrScopedAttributes[$className];
+        }
+
+        try {
+            $reflection = $reflection instanceof ReflectionClass
+                ? $reflection
+                : new ReflectionClass($reflection);
+        } catch (ReflectionException) {
+            return $this->checkedForSingletonOrScopedAttributes[$className] = null;
+        }
+
+        $type = null;
+
+        if (! empty($reflection->getAttributes(Singleton::class))) {
+            $type = 'singleton';
+        } elseif (! empty($reflection->getAttributes(Scoped::class))) {
+            $type = 'scoped';
+        }
+
+        return $this->checkedForSingletonOrScopedAttributes[$className] = $type;
+    }
+
+    /**
+     * Determine if the given abstract type has been resolved.
+     *
+     * @param string $abstract
+     * @return bool
+     */
+    public function resolved(string $abstract): bool
+    {
+        if ($this->isAlias($abstract)) {
+            $abstract = $this->getAlias($abstract);
+        }
+
+        return isset($this->resolved[$abstract]) ||
+            isset($this->instances[$abstract]);
+    }
+
+    /**
+     * Get the last parameter override.
+     *
+     * @return array
+     */
+    protected function getLastParameterOverride(): array
+    {
+        return count($this->with) ? array_last($this->with) : [];
+    }
+
+    /**
+     * Call the given Closure / class@method and inject its dependencies.
+     *
+     * @param callable|string $callback
+     * @param array<string, mixed> $parameters
+     * @param string|null $defaultMethod
+     * @return mixed
+     *
+     * @throws InvalidArgumentException
+     * @throws ReflectionException|BindingResolutionException|CircularDependencyException
+     */
+    public function call(callable|string $callback, array $parameters = [], ?string $defaultMethod = null): mixed
+    {
+        $pushedToBuildStack = false;
+
+        if (($className = $this->getClassForCallable($callback)) && ! in_array(
+                $className,
+                $this->buildStack,
+                true
+            )) {
+            $this->buildStack[] = $className;
+
+            $pushedToBuildStack = true;
+        }
+
+        $result = BoundMethod::call($this, $callback, $parameters, $defaultMethod);
+
+        if ($pushedToBuildStack) {
+            array_pop($this->buildStack);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Determine if the given dependency has a parameter override.
+     *
+     * @param ReflectionParameter $dependency
+     * @return bool
+     */
+    protected function hasParameterOverride(ReflectionParameter $dependency): bool
+    {
+        return array_key_exists(
+            $dependency->name, $this->getLastParameterOverride()
+        );
+    }
+
+    /**
+     * Get a parameter override for a dependency.
+     *
+     * @param ReflectionParameter $dependency
+     * @return mixed
+     */
+    protected function getParameterOverride(ReflectionParameter $dependency): mixed
+    {
+        return $this->getLastParameterOverride()[$dependency->name];
+    }
+
+    /**
+     * Resolve a dependency based on an attribute.
+     *
+     * @param ReflectionAttribute $attribute
+     * @param ReflectionParameter $parameter
+     * @return mixed
+     *
+     * @throws BindingResolutionException
+     */
+    public function resolveFromAttribute(ReflectionAttribute $attribute, ReflectionParameter $parameter): mixed
+    {
+        $handler = $this->contextualAttributes[$attribute->getName()] ?? null;
+
+        $instance = $attribute->newInstance();
+
+        if (is_null($handler) && method_exists($instance, 'resolve')) {
+            $handler = $instance->resolve(...);
+        }
+
+        if (is_null($handler)) {
+            throw new BindingResolutionException("Contextual binding attribute [{$attribute->getName()}] has no registered handler.");
+        }
+
+        return $handler($instance, $this, $parameter);
+    }
+
+    /**
+     * Resolve every dependency from the ReflectionParameters.
+     *
+     * @param ReflectionParameter[] $dependencies
+     * @return array
+     *
+     * @throws BindingResolutionException
+     * @throws CircularDependencyException
+     */
+    protected function resolveDependencies(array $dependencies): array
+    {
+        $results = [];
+
+        foreach ($dependencies as $dependency) {
+            // If the dependency has an override for this particular build we will use
+            // that instead as the value. Otherwise, we will continue with this run
+            // of resolutions and let reflection attempt to determine the result.
+            if ($this->hasParameterOverride($dependency)) {
+                $results[] = $this->getParameterOverride($dependency);
+
+                continue;
+            }
+
+            $result = null;
+
+            if (! is_null($attribute = Util::getContextualAttributeFromDependency($dependency))) {
+                $result = $this->resolveFromAttribute($attribute, $dependency);
+            }
+
+            // If the class is null, it means the dependency is a string or some other
+            // primitive type which we can not resolve since it is not a class and
+            // we will just bomb out with an error since we have no-where to go.
+            $result ??= is_null($className = Util::getParameterClassName($dependency))
+                ? $this->resolvePrimitive($dependency)
+                : $this->resolveClass($dependency, $className);
+
+            $this->fireAfterResolvingAttributeCallbacks($dependency->getAttributes(), $result);
+
+            if ($dependency->isVariadic()) {
+                $results = array_merge($results, $result);
+            } else {
+                $results[] = $result;
+            }
+        }
+
+        return $results;
+    }
+
+    /**
+     * Resolve a class based dependency from the container.
+     *
+     * @param ReflectionParameter $parameter
+     * @param string|null $className
+     * @return mixed
+     *
+     * @throws BindingResolutionException
+     * @throws CircularDependencyException
+     */
+    protected function resolveClass(ReflectionParameter $parameter, ?string $className = null): mixed
+    {
+        $className ??= Util::getParameterClassName($parameter);
+
+        // First we will check if a default value has been defined for the parameter.
+        // If it has, and no explicit binding exists, we should return it to avoid
+        // overriding any of the developer specified defaults for the parameters.
+        if ($parameter->isDefaultValueAvailable() &&
+            ! $this->bound($className) &&
+            $this->findInContextualBindings($className) === null) {
+            return $parameter->getDefaultValue();
+        }
+
+        try {
+            return $parameter->isVariadic()
+                ? $this->resolveVariadicClass($parameter)
+                : $this->make($className);
+        }
+
+            // If we can not resolve the class instance, we will check to see if the value
+            // is variadic. If it is, we will return an empty array as the value of the
+            // dependency similarly to how we handle scalar values in this situation.
+        catch (BindingResolutionException $e) {
+            if ($parameter->isVariadic()) {
+                array_pop($this->with);
+
+                return [];
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Resolve a class based variadic dependency from the container.
+     *
+     * @param ReflectionParameter $parameter
+     * @return mixed
+     * @throws BindingResolutionException
+     * @throws CircularDependencyException
+     * @throws ReflectionException
+     */
+    protected function resolveVariadicClass(ReflectionParameter $parameter): mixed
+    {
+        $className = Util::getParameterClassName($parameter);
+
+        $abstract = $this->getAlias($className);
+
+        if (! is_array($concrete = $this->getContextualConcrete($abstract))) {
+            return $this->make($className);
+        }
+
+        return array_map(fn ($abstract) => $this->resolve($abstract), $concrete);
+    }
+
+    /**
+     * Resolve a non-class hinted primitive dependency.
+     *
+     * @param ReflectionParameter $parameter
+     * @return mixed
+     *
+     * @throws BindingResolutionException
+     */
+    protected function resolvePrimitive(ReflectionParameter $parameter): mixed
+    {
+        if (! is_null($concrete = $this->getContextualConcrete('$'.$parameter->getName()))) {
+            return Util::unwrapIfClosure($concrete, $this);
+        }
+
+        if ($parameter->isDefaultValueAvailable()) {
+            return $parameter->getDefaultValue();
+        }
+
+        if ($parameter->isVariadic()) {
+            return [];
+        }
+
+        if ($parameter->hasType() && $parameter->allowsNull()) {
+            return null;
+        }
+
+        $this->unresolvablePrimitive($parameter);
+    }
+
+    /**
+     * Throw an exception for an unresolvable primitive.
+     *
+     * @param ReflectionParameter $parameter
+     * @return void
+     *
+     * @throws BindingResolutionException
+     */
+    protected function unresolvablePrimitive(ReflectionParameter $parameter): void
+    {
+        $message = "Unresolvable dependency resolving [$parameter] in class {$parameter->getDeclaringClass()->getName()}";
+
+        throw new BindingResolutionException($message);
+    }
+
+    /**
+     * Get the value at a given offset.
+     *
+     * @param string $offset
+     * @throws BindingResolutionException|CircularDependencyException|ReflectionException
+     */
+    public function offsetGet($offset): mixed
+    {
+        return $this->make($offset);
+    }
+
+    /**
+     * Set the value at a given offset.
+     *
+     * @param string $offset
+     * @param mixed $value
+     * @throws BindingResolutionException|CircularDependencyException|ReflectionException
+     */
+    public function offsetSet($offset, mixed $value): void
+    {
+        $this->bind($offset, $value instanceof Closure ? $value : fn () => $value);
+    }
+
+    /**
+     * Unset the value at a given offset.
+     *
+     * @param  string  $offset
+     */
+    public function offsetUnset($offset): void
+    {
+        unset($this->bindings[$offset], $this->instances[$offset], $this->resolved[$offset]);
+    }
+
+    /**
+     * Dynamically access container services.
+     *
+     * @param string $key
+     * @return mixed
+     */
+    public function __get(string $key)
+    {
+        return $this[$key];
+    }
+
+    /**
+     * Dynamically set container services.
+     *
+     * @param string $key
+     * @param  mixed  $value
+     * @return void
+     */
+    public function __set(string $key, mixed $value)
+    {
+        $this[$key] = $value;
+    }
+
+    /**
+     * Determine if a given offset exists.
+     *
+     * @param  string  $offset
+     */
+    public function offsetExists($offset): bool
+    {
+        return $this->bound($offset);
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function has(string $id): bool
+    {
+        return $this->bound($id);
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * @template TClass of object
+     *
+     * @param  string|class-string<TClass>  $id
+     * @return ($id is class-string<TClass> ? TClass : mixed)
+     *
+     * @throws CircularDependencyException
+     * @throws EntryNotFoundException
+     */
+    public function get(string $id): mixed
+    {
+        try {
+            return $this->resolve($id);
+        } catch (Exception $e) {
+            if ($this->has($id) || $e instanceof CircularDependencyException) {
+                throw $e;
+            }
+
+            throw new EntryNotFoundException($id, is_int($e->getCode()) ? $e->getCode() : 0, $e);
+        }
+    }
+
+    /**
+     * Register an existing instance as shared in the container.
+     *
+     * @template TInstance of mixed
+     *
+     * @param  string  $abstract
+     * @param  TInstance  $instance
+     * @return TInstance
+     * @throws ReflectionException|CircularDependencyException|BindingResolutionException
+ */
+    public function instance($abstract, $instance): mixed
+    {
+        $this->removeAbstractAlias($abstract);
+
+        $isBound = $this->bound($abstract);
+
+        unset($this->aliases[$abstract]);
+
+        // We'll check to determine if this type has been bound before, and if it has
+        // we will fire the rebound callbacks registered with the container and it
+        // can be updated with consuming classes that have gotten resolved here.
+        $this->instances[$abstract] = $instance;
+
+        if ($isBound) {
+            $this->rebound($abstract);
+        }
+
+        return $instance;
+    }
+
+    /**
+     * Get a closure to resolve the given type from the container.
+     *
+     * @template TClass of object
+     *
+     * @param string|class-string<TClass> $abstract
+     * @return ($abstract is class-string<TClass> ? Closure(): TClass : Closure(): mixed)
+     */
+    public function factory(string $abstract): callable
+    {
+        return fn () => $this->make($abstract);
+    }
+
+
+    /**
+     * Flush the container of all bindings and resolved instances.
+     *
+     * @return void
+     */
+    public function flush(): void
+    {
+        $this->aliases = [];
+        $this->resolved = [];
+        $this->bindings = [];
+        $this->instances = [];
+        $this->abstractAliases = [];
+        $this->scopedInstances = [];
+        $this->checkedForAttributeBindings = [];
+        $this->checkedForSingletonOrScopedAttributes = [];
+    }
+
+    /**
+     * Register a new before resolving callback for all types.
+     *
+     * @param Closure|string $abstract
+     * @param Closure|callable|null $callback
+     * @return void
+     */
+    public function beforeResolving($abstract, Closure|callable|null $callback = null): void
+    {
+        if (is_string($abstract)) {
+            $abstract = $this->getAlias($abstract);
+        }
+
+        if ($abstract instanceof Closure && is_null($callback)) {
+            $this->globalBeforeResolvingCallbacks[] = $abstract;
+        } else {
+            $this->beforeResolvingCallbacks[$abstract][] = $callback;
+        }
+    }
+
+    /**
+     * Register a new resolving callback.
+     *
+     * @param Closure|string $abstract
+     * @param Closure|callable|null $callback
+     * @return void
+     */
+    public function resolving($abstract, Closure|callable|null $callback = null): void
+    {
+        if (is_string($abstract)) {
+            $abstract = $this->getAlias($abstract);
+        }
+
+        if (is_null($callback) && $abstract instanceof Closure) {
+            $this->globalResolvingCallbacks[] = $abstract;
+        } else {
+            $this->resolvingCallbacks[$abstract][] = $callback;
+        }
+    }
+
+    /**
+     * Determine if the container has a method binding.
+     *
+     * @param string $method
+     * @return bool
+     */
+    public function hasMethodBinding(string $method): bool
+    {
+        return isset($this->methodBindings[$method]);
+    }
+
+    /**
+     * Register a new after resolving callback for all types.
+     *
+     * @param Closure|string $abstract
+     * @param Closure|callable|null $callback
+     * @return void
+     */
+    public function afterResolving($abstract, Closure|callable|null $callback = null): void
+    {
+        if (is_string($abstract)) {
+            $abstract = $this->getAlias($abstract);
+        }
+
+        if ($abstract instanceof Closure && is_null($callback)) {
+            $this->globalAfterResolvingCallbacks[] = $abstract;
+        } else {
+            $this->afterResolvingCallbacks[$abstract][] = $callback;
+        }
+    }
+
+    /**
+     * Get the globally available instance of the container.
+     *
+     * @return static
+     */
+    public static function getInstance(): static
+    {
+        return static::$container ??= new static;
+    }
+
+    /**
+     * Set the shared instance of the container.
+     *
+     * @param WireframeServiceContainer|null $container
+     * @return WireframeServiceContainer|static
+     */
+    public static function setInstance(?WireframeServiceContainer $container = null): WireframeServiceContainer|static
+    {
+        return static::$container = $container;
+    }
+}
