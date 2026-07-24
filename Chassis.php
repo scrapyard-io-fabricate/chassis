@@ -30,9 +30,9 @@ class Chassis implements WireframeServiceContainer, ArrayAccess
     /**
      * The current globally available service container (if any).
      *
-     * @var static
+     * @var static|null
      */
-    protected static WireframeServiceContainer $container;
+    protected static ?WireframeServiceContainer $container = null;
 
     /**
      * An array of the types that have been resolved.
@@ -709,6 +709,19 @@ class Chassis implements WireframeServiceContainer, ArrayAccess
     }
 
     /**
+     * Get the method binding for the given method.
+     *
+     * @param string $method
+     * @param  mixed  $instance
+     * @return mixed
+     */
+    public function callMethodBinding(string $method, mixed $instance): mixed
+    {
+        return call_user_func($this->methodBindings[$method], $instance, $this);
+    }
+
+
+    /**
      * Register a new after resolving callback for all types.
      *
      * @param Closure|string $abstract
@@ -742,9 +755,9 @@ class Chassis implements WireframeServiceContainer, ArrayAccess
      * Set the shared instance of the container.
      *
      * @param WireframeServiceContainer|null $container
-     * @return WireframeServiceContainer|static
+     * @return WireframeServiceContainer|static|null
      */
-    public static function setInstance(?WireframeServiceContainer $container = null): WireframeServiceContainer|static
+    public static function setInstance(?WireframeServiceContainer $container = null): WireframeServiceContainer|static|null
     {
         return static::$container = $container;
     }

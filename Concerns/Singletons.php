@@ -67,6 +67,18 @@ trait Singletons
 
 
     /**
+     * Clear all of the scoped instances from the container.
+     *
+     * @return void
+     */
+    public function forgetScopedInstances(): void
+    {
+        foreach ($this->scopedInstances as $scoped) {
+            unset($this->instances[$scoped]);
+        }
+    }
+
+    /**
      * Drop every stale instances and aliases.
      *
      * @param string $abstract
